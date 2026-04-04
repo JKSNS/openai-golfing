@@ -1098,10 +1098,21 @@ def eval_val_sliding(
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
 ) -> tuple[float, float]:
-    """Sliding window evaluation with optional SLOT delta optimization."""
-    slot_steps = int(os.environ.get("SLOT_STEPS", "16"))
-    slot_lr = float(os.environ.get("SLOT_LR", "0.008"))
-    slot_lr_min = float(os.environ.get("SLOT_LR_MIN", "0.0008"))
+    """Sliding window evaluation with optional SLOT delta optimization.
+
+    Supports two SLOT modes:
+    - AdamW (SLOT_LBFGS=0): Per-sample delta + logit bias, cosine LR schedule
+    - L-BFGS (SLOT_LBFGS=1): Logit-space delta, warm-start across windows
+    """
+    slot_steps = int(os.environ.get("SLOT_STEPS", "24"))
+    slot_lr = float(os.environ.get("SLOT_LR", "0.012"))
+    slot_lr_min = float(os.environ.get("SLOT_LR_MIN", "0.001"))
+    slot_lbfgs = bool(int(os.environ.get("SLOT_LBFGS", "0")))
+    slot_lbfgs_max_iter = int(os.environ.get("SLOT_LBFGS_MAX_ITER", 25))
+    slot_lbfgs_history = int(os.environ.get("SLOT_LBFGS_HISTORY", 20))
+    slot_warmstart_alpha = float(os.environ.get("SLOT_WARMSTART_ALPHA", 0.85))
+    slot_delta_clip = float(os.environ.get("SLOT_DELTA_CLIP", 5.0))
+    slot_focal_tokens = int(os.environ.get("SLOT_FOCAL_TOKENS", 0))  # 0 = use mask, >0 = last N tokens
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -1122,6 +1133,9 @@ def eval_val_sliding(
         else:
             proj_w = base_model.lm_head.weight.detach().float()
         softcap = base_model.logit_softcap
+        # Warm-start state: carry delta across batches
+        _warmstart_delta = None
+        _warmstart_bias = None
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
             bsz = len(batch_ws)
@@ -1138,44 +1152,92 @@ def eval_val_sliding(
             # Frozen hidden states (no_grad, not inference_mode, for SLOT compat)
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 hidden = compiled_hidden(x_batch)
-            # Scored-position mask: optimize SLOT delta only on positions that
-            # contribute to final BPB (last `stride` tokens per non-first window)
+            # Scored-position mask
             mask = torch.zeros(bsz, seq_len, device=device)
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
                 mask[i, s:wlen] = 1.0
             valid_count = mask.sum()
-            # SLOT: optimize additive delta vector + direct logit bias
-            delta = torch.zeros(bsz, 1, hidden.size(-1), device=device, dtype=torch.float32, requires_grad=True)
-            logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device, dtype=torch.float32, requires_grad=True)
-            slot_opt = torch.optim.AdamW([delta, logit_bias], lr=slot_lr)
-            targets_flat = y_batch.reshape(-1)
             hidden_f = hidden.float()
-            for _step in range(slot_steps):
-                _lr = slot_lr_min + 0.5 * (slot_lr - slot_lr_min) * (1 + math.cos(math.pi * _step / slot_steps))
-                for _pg in slot_opt.param_groups:
-                    _pg['lr'] = _lr
-                h = hidden_f + delta
-                logits_proj = F.linear(h, proj_w) + logit_bias
-                logits = softcap * torch.tanh(logits_proj / softcap)
-                nll_opt = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    targets_flat, reduction="none",
-                ).reshape(bsz, seq_len)
-                slot_loss = (nll_opt * mask).sum() / valid_count
-                slot_opt.zero_grad()
-                slot_loss.backward()
-                slot_opt.step()
-            # Final scoring with optimized delta + logit bias
-            with torch.no_grad():
-                h = hidden_f + delta
-                logits_proj = F.linear(h, proj_w) + logit_bias
-                logits = softcap * torch.tanh(logits_proj / softcap)
-                nll = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    targets_flat, reduction="none",
-                ).reshape(bsz, seq_len)
+            targets_flat = y_batch.reshape(-1)
+
+            if slot_lbfgs:
+                # L-BFGS SLOT: optimize in logit space (more direct gradients)
+                with torch.no_grad():
+                    logits_base = F.linear(hidden_f, proj_w)
+                logit_delta = torch.zeros(1, 1, proj_w.size(0), device=device,
+                                          dtype=torch.float32, requires_grad=True)
+                # Warm-start from previous batch
+                if _warmstart_bias is not None and slot_warmstart_alpha > 0:
+                    logit_delta.data.copy_(_warmstart_bias * slot_warmstart_alpha)
+                lbfgs_opt = torch.optim.LBFGS(
+                    [logit_delta], lr=1.0, max_iter=slot_lbfgs_max_iter,
+                    history_size=slot_lbfgs_history, line_search_fn='strong_wolfe',
+                    tolerance_change=1e-9, tolerance_grad=1e-7,
+                )
+                def _lbfgs_closure():
+                    lbfgs_opt.zero_grad()
+                    logits_opt = logits_base + logit_delta.to(logits_base.dtype)
+                    logits_sc = softcap * torch.tanh(logits_opt / softcap)
+                    nll = F.cross_entropy(
+                        logits_sc.reshape(-1, logits_sc.size(-1)),
+                        targets_flat, reduction="none",
+                    ).reshape(bsz, seq_len)
+                    loss = (nll * mask).sum() / valid_count
+                    loss.backward()
+                    return loss
+                lbfgs_opt.step(_lbfgs_closure)
+                logit_delta.data.clamp_(-slot_delta_clip, slot_delta_clip)
+                _warmstart_bias = logit_delta.detach().clone()
+                # Final scoring
+                with torch.no_grad():
+                    logits_opt = logits_base + logit_delta.to(logits_base.dtype)
+                    logits = softcap * torch.tanh(logits_opt / softcap)
+                    nll = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets_flat, reduction="none",
+                    ).reshape(bsz, seq_len)
+            else:
+                # AdamW SLOT: per-sample delta + logit bias
+                delta = torch.zeros(bsz, 1, hidden.size(-1), device=device,
+                                    dtype=torch.float32, requires_grad=True)
+                logit_bias = torch.zeros(bsz, 1, proj_w.size(0), device=device,
+                                         dtype=torch.float32, requires_grad=True)
+                # Warm-start from previous batch mean
+                if _warmstart_delta is not None and slot_warmstart_alpha > 0:
+                    delta.data.copy_(_warmstart_delta * slot_warmstart_alpha)
+                if _warmstart_bias is not None and slot_warmstart_alpha > 0:
+                    logit_bias.data.copy_(_warmstart_bias * slot_warmstart_alpha)
+                slot_opt = torch.optim.AdamW([delta, logit_bias], lr=slot_lr)
+                for _step in range(slot_steps):
+                    _lr = slot_lr_min + 0.5 * (slot_lr - slot_lr_min) * (
+                        1 + math.cos(math.pi * _step / slot_steps))
+                    for _pg in slot_opt.param_groups:
+                        _pg['lr'] = _lr
+                    h = hidden_f + delta
+                    logits_proj = F.linear(h, proj_w) + logit_bias
+                    logits = softcap * torch.tanh(logits_proj / softcap)
+                    nll_opt = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets_flat, reduction="none",
+                    ).reshape(bsz, seq_len)
+                    slot_loss = (nll_opt * mask).sum() / valid_count
+                    slot_opt.zero_grad()
+                    slot_loss.backward()
+                    slot_opt.step()
+                # Save warm-start state (mean across batch)
+                _warmstart_delta = delta.detach().mean(dim=0, keepdim=True).clone()
+                _warmstart_bias = logit_bias.detach().mean(dim=0, keepdim=True).clone()
+                # Final scoring with optimized delta + logit bias
+                with torch.no_grad():
+                    h = hidden_f + delta
+                    logits_proj = F.linear(h, proj_w) + logit_bias
+                    logits = softcap * torch.tanh(logits_proj / softcap)
+                    nll = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)),
+                        targets_flat, reduction="none",
+                    ).reshape(bsz, seq_len)
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
