@@ -31,25 +31,25 @@ Train the best language model fitting in **16MB**, trainable in **≤10 min on 8
 - Lower is better
 - Byte counting uses SentencePiece lookup tables with leading-space handling
 
-## Baseline Architecture (train_gpt.py, 1126 lines)
+## Our Architecture (src/train_gpt.py, ~2547 lines)
 
 ```
-Layers:         9 (4 encoder + 5 decoder, U-Net skips)
+Layers:         11 physical → 13 virtual (depth recurrence on layers 4,5)
 Model dim:      512
-Heads:          8 query, 4 KV (GQA)
-MLP:            2× width (1024), ReluSquared activation
+Heads:          8 query, 4 KV (GQA), QK-Gain 5.0
+MLP:            3× width (1536), LeakyReLU(0.5)²
 Vocab:          1024 (SentencePiece BPE)
-Embeddings:     Tied (input = output projection)
-Normalization:  RMSNorm (no learned params)
-Position:       RoPE (base=10000)
-Logit cap:      softcap=30.0
-Optimizer:      Muon (matrix params) + Adam (scalars, embeddings)
-LR:             matrix=0.04, embed=0.05, scalar=0.04
-Warmdown:       1200 iters (wallclock-adaptive)
-Batch:          524,288 tokens/step
-Seq length:     1024
-Quantization:   int8 per-row + zlib-9
-~Steps in 10m:  ~13,700
+Embeddings:     Tied FP16, BigramHash 2048×128, SmearGate
+Normalization:  RMSNorm, LN scale 1/sqrt(layer+1)
+Position:       Partial RoPE (16/64 dims)
+Attention:      XSA all layers, VE128 on layers 9-10
+Structure:      U-Net skips + Parallel Residuals from layer 7
+Optimizer:      MuonEq-R (WD=0.09) + AdamW, EMA(0.997)+SWA
+Training:       Late QAT, warmdown=3500, seq_len=2048
+Quantization:   Full Hessian GPTQ int6 + Brotli + byte-shuffle + selective pruning
+Pre-quant TTT:  6 epochs AdamW on val data, freeze 2 blocks
+SLOT:           L-BFGS 10 iter, logit-space delta, warm-start α=0.85, focal-128
+~Steps in 10m:  ~5,900
 ```
 
 ## The "Standard Stack" (what every competitive entry uses)
