@@ -17,7 +17,7 @@ Our workspace for the [OpenAI Parameter Golf](https://github.com/openai/paramete
 | Best pending (SLOT) | 0.8637 | PR #1313 — SLOT-24 eval-time optimization |
 | Best pending (TTT+SLOT) | 1.0096 | PR #1318 — L-BFGS SLOT + TTT |
 | **Our target (sliding)** | **≤1.08** | **Competitive model quality** |
-| **Our target (with SLOT)** | **≤0.90** | **Leaderboard contender** |
+| **Our target (L-BFGS SLOT)** | **≤0.76** | **World record attempt** |
 
 ## Quick Start
 
