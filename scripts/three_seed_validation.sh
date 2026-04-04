@@ -23,10 +23,11 @@ for SEED in 1337 42 314; do
     DATA_PATH=./upstream/data/datasets/fineweb10B_sp1024/ \
     TOKENIZER_PATH=./upstream/data/tokenizers/fineweb_1024_bpe.model \
     VOCAB_SIZE=1024 \
-    SLOT_STEPS=24 \
-    SLOT_LR=0.012 \
-    SLOT_LR_MIN=0.001 \
+    SLOT_LBFGS=1 \
+    SLOT_LBFGS_MAX_ITER=10 \
     SLOT_WARMSTART_ALPHA=0.85 \
+    SLOT_DELTA_CLIP=5.0 \
+    SLOT_FOCAL_TOKENS=128 \
     TTT_ENABLED=1 \
     TTT_EPOCHS=6 \
     TTT_FREEZE_BLOCKS=2 \
@@ -44,4 +45,4 @@ done
 echo "=== All 3 seeds complete ==="
 echo "Grep for 'val_bpb' in experiments/validation_seed*.log to compare"
 echo ""
-grep -h "val_bpb" experiments/validation_seed*.log 2>/dev/null | tail -6
+grep -h "val_bpb" experiments/validation_seed*.log 2>/dev/null | tail -9
