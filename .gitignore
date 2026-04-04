@@ -1,0 +1,26 @@
+# Data (downloaded separately)
+upstream/
+data/
+
+# Model artifacts
+*.ptz
+*.pt
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs (keep experiment logs, ignore temp)
+*.log.tmp
