@@ -141,8 +141,57 @@ Ranked by **BPB improvement per implementation effort**. Every serious submissio
 | N-gram eval caches | Invalidated | Probability normalization bugs |
 | CDQuant, Qronos | Fail | Advanced quant beyond GPTQ doesn't help |
 
+## Tier 6: Eval-Time Optimization (The New Meta — April 2026)
+
+These techniques have **redefined the competition**. The pending PRs show SLOT-based entries pushing below 1.0 BPB.
+
+### 19. SLOT — Score-First Learned Optimization at Test-time
+- **BPB gain:** -0.10 to -0.44 (depending on steps/config)
+- **Effort:** Medium–High
+- **What:** Per sliding window, optimize throwaway parameters (delta + logit_bias) against validation loss using frozen model weights. Only tokens already scored contribute to the optimization (causal/score-first protocol).
+- **Variants:**
+  - **AdamW SLOT:** 16–64 steps per window, delta in hidden space (512-dim) + logit_bias (1024-dim). PR #1313 achieves 0.8637 BPB.
+  - **L-BFGS SLOT:** Logit-space delta (1024-dim), L-BFGS with warm-start. PR #1318 achieves 1.0096 BPB. More stable, fewer hyperparams.
+  - **Causal SLOT:** Only backward-looking positions used for optimization. PR #1306 achieves 1.0846 BPB.
+- **Warmstart:** Inherit 85% of previous window's delta — exploits sequential locality.
+- **Eval time budget:** 230–825s depending on config. Must fit in 600s eval limit.
+- **Key insight:** 1,536 free parameters per window against ~96 scored tokens = 16 params per token.
+- **Ref:** arXiv:2505.12392v2, PRs #1176, #1229, #1306, #1313, #1318, #1319
+
+### 20. Pre-Quant TTT (Test-Time Training)
+- **BPB gain:** -0.022
+- **Effort:** Medium
+- **What:** Fine-tune EMA model on validation data BEFORE GPTQ quantization (not after — post-quant TTT fails on GPTQ stacks). AdamW lr=0.0005, cosine decay, 6 epochs, freeze first 2 blocks, grad clip 1.0. Takes ~111s.
+- **Key insight:** Post-quant TTT was tried 25+ times and failed (PR #756). Pre-quant TTT works because adapted weights quantize better.
+- **Ref:** PR #1006, #1306
+
+### 21. Additional New Techniques (April 2026 PRs)
+- **MTP (Multi-Token Prediction):** 2 auxiliary heads, loss weight 0.1 — used in PR #1318
+- **Focal loss (gamma=1.0):** Downweight easy tokens — used in PR #1319
+- **Sqrt warmdown:** `1 - sqrt(1 - frac)` curve, more time at moderate LR — PR #1319
+- **MuonEq-R:** Row-normalized Muon variant — PRs #1289, #1296
+- **Depth Recurrence:** Shared layer weights, 2 forward passes — PRs #1289, #1296
+- **Scylla tokenizer:** TokenMonster-derived 998-token vocab — PR #1289
+- **SP4096:** Larger SentencePiece vocab — PRs #1287, #1296 (1.0897 without SLOT!)
+- **N-gram sequence matching:** Exact n-gram matching as eval-time boost — PR #1309 (1.1143)
+- **QK-Gain 4.0–5.0:** Higher initial query scaling — PRs #1296, #1303, #1313
+
+## Competitive Landscape (April 3, 2026)
+
+The leaderboard README is **stale**. Real competitive state from open PRs:
+
+| Tier | Best BPB | Method | Key Technique |
+|------|----------|--------|---------------|
+| SLOT aggressive | 0.6951 | PR #1319 | SLOT-64 warmstart (OVER eval time limit) |
+| SLOT moderate | 0.8637 | PR #1313 | SLOT-24 AdamW |
+| TTT + SLOT | 1.0096 | PR #1318 | L-BFGS SLOT + TTT |
+| Causal SLOT + TTT | 1.0846 | PR #1306 | Causal SLOT + Pre-quant TTT |
+| Sliding only (no SLOT) | 1.0897 | PR #1296 | SP4096 + Depth Recurrence + MuonEq-R |
+| Merged SOTA | 1.1147 | PR #1019 | AR Self-Gen GPTQ + XSA-all |
+
 ## Implementation Priority (Recommended Order)
 
+**Phase A — Model Quality (sliding window eval)**
 1. Reproduce baseline (1.2244)
 2. Sliding window eval (→ ~1.19)
 3. LeakyReLU² + warmdown tuning (→ ~1.18)
@@ -150,4 +199,9 @@ Ranked by **BPB improvement per implementation effort**. Every serious submissio
 5. XSA all layers + EMA (→ ~1.13)
 6. BigramHash + SmearGate + OrthoInit (→ ~1.12)
 7. GPTQ + self-gen calibration (→ ~1.11)
-8. Novel ideas (→ <1.11?)
+8. SP4096 + Depth Recurrence + MuonEq-R (→ ~1.09)
+
+**Phase B — Eval-Time Optimization (SLOT/TTT on top)**
+9. Pre-quant TTT (→ ~1.07)
+10. SLOT (L-BFGS or AdamW variant) (→ ~0.9–1.0)
+11. Tune SLOT hyperparams within 600s eval budget

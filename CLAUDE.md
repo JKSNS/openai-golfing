@@ -7,7 +7,9 @@ Train the best language model fitting in **16MB**, trainable in **≤10 min on 8
 
 - Upstream repo: https://github.com/openai/parameter-golf
 - **Deadline: April 30, 2026**
-- Leaderboard SOTA: **1.1147 BPB** (abaybektursun, PR #1019, Mar 25)
+- Merged SOTA: **1.1147 BPB** (abaybektursun, PR #1019, Mar 25)
+- **Real frontier (pending PRs, Apr 3):** ~0.86–1.09 BPB (SLOT-based eval optimization)
+- Best pending sliding-only: **1.0897 BPB** (PR #1296, SP4096 + depth recurrence)
 - Naive baseline: **1.2244 BPB**
 
 ## Hard Constraints
