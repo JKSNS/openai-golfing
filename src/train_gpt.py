@@ -1107,12 +1107,12 @@ def eval_val_sliding(
     slot_steps = int(os.environ.get("SLOT_STEPS", "24"))
     slot_lr = float(os.environ.get("SLOT_LR", "0.012"))
     slot_lr_min = float(os.environ.get("SLOT_LR_MIN", "0.001"))
-    slot_lbfgs = bool(int(os.environ.get("SLOT_LBFGS", "0")))
-    slot_lbfgs_max_iter = int(os.environ.get("SLOT_LBFGS_MAX_ITER", 25))
+    slot_lbfgs = bool(int(os.environ.get("SLOT_LBFGS", "1")))  # L-BFGS by default (faster convergence)
+    slot_lbfgs_max_iter = int(os.environ.get("SLOT_LBFGS_MAX_ITER", 10))  # 10 iter + warm-start ≈ 25 without
     slot_lbfgs_history = int(os.environ.get("SLOT_LBFGS_HISTORY", 20))
     slot_warmstart_alpha = float(os.environ.get("SLOT_WARMSTART_ALPHA", 0.85))
     slot_delta_clip = float(os.environ.get("SLOT_DELTA_CLIP", 5.0))
-    slot_focal_tokens = int(os.environ.get("SLOT_FOCAL_TOKENS", 0))  # 0 = use mask, >0 = last N tokens
+    slot_focal_tokens = int(os.environ.get("SLOT_FOCAL_TOKENS", 128))  # focus on scored suffix
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -1176,15 +1176,28 @@ def eval_val_sliding(
                     history_size=slot_lbfgs_history, line_search_fn='strong_wolfe',
                     tolerance_change=1e-9, tolerance_grad=1e-7,
                 )
+                # Pre-compute focal region for faster closure
+                if slot_focal_tokens > 0:
+                    focal_s = max(seq_len - slot_focal_tokens, 0)
+                    focal_logits_base = logits_base[:, focal_s:, :]
+                    focal_targets = y_batch[:, focal_s:].reshape(-1)
+                    focal_mask = mask[:, focal_s:]
+                    focal_valid = focal_mask.sum().clamp_min(1)
+                else:
+                    focal_logits_base = logits_base
+                    focal_targets = targets_flat
+                    focal_mask = mask
+                    focal_valid = valid_count
+
                 def _lbfgs_closure():
                     lbfgs_opt.zero_grad()
-                    logits_opt = logits_base + logit_delta.to(logits_base.dtype)
+                    logits_opt = focal_logits_base + logit_delta.to(focal_logits_base.dtype)
                     logits_sc = softcap * torch.tanh(logits_opt / softcap)
                     nll = F.cross_entropy(
                         logits_sc.reshape(-1, logits_sc.size(-1)),
-                        targets_flat, reduction="none",
-                    ).reshape(bsz, seq_len)
-                    loss = (nll * mask).sum() / valid_count
+                        focal_targets, reduction="none",
+                    ).reshape(focal_logits_base.size(0), focal_logits_base.size(1))
+                    loss = (nll * focal_mask).sum() / focal_valid
                     loss.backward()
                     return loss
                 lbfgs_opt.step(_lbfgs_closure)
