@@ -102,6 +102,8 @@ class Hyperparameters:
     recur_layers = os.environ.get("RECUR_LAYERS", "4,5")  # physical layer indices to repeat
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))  # activate after this step
     recur_enabled = bool(int(os.environ.get("RECUR_ENABLED", "1")))
+    # Parallel residuals: split attention/MLP into separate lanes from this layer
+    parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", "7"))
     # MuonEq-R: row normalization before Newton-Schulz
     muon_eq_r = bool(int(os.environ.get("MUON_EQ_R", "1")))
     # TTT: AdamW test-time training (pre-quantization, on EMA model)
@@ -910,6 +912,13 @@ class GPT(nn.Module):
         # Depth recurrence state
         self._recurrence_active = False
         self.recur_layers: list[int] = []
+        # Parallel residuals: split attn/MLP into lanes from this layer
+        parallel_start = int(os.environ.get("PARALLEL_START_LAYER", "7"))
+        self.parallel_start_layer = parallel_start
+        if parallel_start > 0 and parallel_start < num_layers:
+            self.lane_merge = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        else:
+            self.lane_merge = None
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -989,6 +998,9 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        parallel_phys = self.parallel_start_layer if self.lane_merge is not None else n + 1
+        is_parallel = False
+        lane0 = lane1 = None
         for i in range(v_dec):
             vi = v_enc + i
             phys = virtual[vi]
@@ -997,11 +1009,32 @@ class GPT(nn.Module):
                 skip_idx = min(i, self.num_skip_weights - 1)
                 g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                 x = torch.lerp(self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip, x, g)
-            ve = self._get_ve(phys, input_ids, ve_cache)
-            x, _ = self.blocks[phys](x, x0,
-                self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
-                self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
-                v_embed=ve, v0=v0)
+            # Enter parallel mode when we reach the parallel_start_layer
+            if phys >= parallel_phys and not is_parallel:
+                lane0 = x  # attention lane
+                lane1 = x  # MLP lane
+                is_parallel = True
+            if is_parallel:
+                block = self.blocks[phys]
+                ve = self._get_ve(phys, input_ids, ve_cache)
+                mix = block.resid_mix.to(dtype=lane0.dtype)
+                attn_in = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+                attn_out, _ = block.attn(block.attn_norm(attn_in) * block.ln_scale_factor,
+                    self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                    self.qo_bank[n + phys], v_embed=ve, v0=v0)
+                lane0 = attn_in + block.attn_scale.to(dtype=attn_in.dtype)[None, None, :] * attn_out
+                mlp_in = block.mlp_norm(lane1) * block.ln_scale_factor
+                mlp_out = block.mlp(mlp_in, self.mlp_up_bank[phys], self.mlp_down_bank[phys])
+                lane1 = lane1 + block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+            else:
+                ve = self._get_ve(phys, input_ids, ve_cache)
+                x, _ = self.blocks[phys](x, x0,
+                    self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                    self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
+                    v_embed=ve, v0=v0)
+        if is_parallel:
+            m = self.lane_merge.to(dtype=lane0.dtype)
+            x = m * lane0 + (1 - m) * lane1
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1055,6 +1088,9 @@ class GPT(nn.Module):
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
+        parallel_phys = self.parallel_start_layer if self.lane_merge is not None else n + 1
+        is_parallel = False
+        lane0 = lane1 = None
         for i in range(v_dec):
             vi = v_enc + i
             phys = virtual[vi]
@@ -1063,11 +1099,31 @@ class GPT(nn.Module):
                 skip_idx = min(i, self.num_skip_weights - 1)
                 g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                 x = torch.lerp(self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip, x, g)
-            ve = self._get_ve(phys, input_ids, ve_cache)
-            x, _ = self.blocks[phys](x, x0,
-                self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
-                self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
-                v_embed=ve, v0=v0)
+            if phys >= parallel_phys and not is_parallel:
+                lane0 = x
+                lane1 = x
+                is_parallel = True
+            if is_parallel:
+                block = self.blocks[phys]
+                ve = self._get_ve(phys, input_ids, ve_cache)
+                mix = block.resid_mix.to(dtype=lane0.dtype)
+                attn_in = mix[0][None, None, :] * lane0 + mix[1][None, None, :] * x0
+                attn_out, _ = block.attn(block.attn_norm(attn_in) * block.ln_scale_factor,
+                    self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                    self.qo_bank[n + phys], v_embed=ve, v0=v0)
+                lane0 = attn_in + block.attn_scale.to(dtype=attn_in.dtype)[None, None, :] * attn_out
+                mlp_in = block.mlp_norm(lane1) * block.ln_scale_factor
+                mlp_out = block.mlp(mlp_in, self.mlp_up_bank[phys], self.mlp_down_bank[phys])
+                lane1 = lane1 + block.mlp_scale.to(dtype=lane1.dtype)[None, None, :] * mlp_out
+            else:
+                ve = self._get_ve(phys, input_ids, ve_cache)
+                x, _ = self.blocks[phys](x, x0,
+                    self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                    self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
+                    v_embed=ve, v0=v0)
+        if is_parallel:
+            m = self.lane_merge.to(dtype=lane0.dtype)
+            x = m * lane0 + (1 - m) * lane1
         return self.final_norm(x)
 
     def compute_logits(self, hidden: Tensor) -> Tensor:
@@ -2350,7 +2406,7 @@ def main() -> None:
                 out[i] = data[idx]
                 idx += 1
         return bytes(out)
-    target_mb = float(os.environ.get("TARGET_MB", "15.2"))
+    target_mb = float(os.environ.get("TARGET_MB", "15.13"))
     code_bytes_est = len(code.encode("utf-8"))
     ones_info = []  # (tensor_key, flat_idx, error)
     for name, info in quant_meta.items():
