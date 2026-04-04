@@ -49,7 +49,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -82,7 +82,7 @@ class Hyperparameters:
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 10))
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
-    muon_wd = float(os.environ.get("MUON_WD", 0.04))
+    muon_wd = float(os.environ.get("MUON_WD", 0.09))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
@@ -98,6 +98,12 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
+    # Depth recurrence: run specified layers twice for more virtual depth
+    recur_layers = os.environ.get("RECUR_LAYERS", "4,5")  # physical layer indices to repeat
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))  # activate after this step
+    recur_enabled = bool(int(os.environ.get("RECUR_ENABLED", "1")))
+    # MuonEq-R: row normalization before Newton-Schulz
+    muon_eq_r = bool(int(os.environ.get("MUON_EQ_R", "1")))
     # TTT: AdamW test-time training (pre-quantization, on EMA model)
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.0005))
@@ -252,6 +258,10 @@ class Muon(torch.optim.Optimizer):
                 else:
                     update = buf
 
+                # MuonEq-R: row-normalize before NS5 (arXiv:2603.28254)
+                if self.defaults.get('eq_r', False):
+                    row_norms = update.float().norm(dim=-1, keepdim=True).clamp_min(1e-7)
+                    update = update / row_norms.to(update.dtype)
                 update = zeropower_via_newtonschulz5(update, steps=backend_steps)
 
                 if sharded:
@@ -897,6 +907,9 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # Depth recurrence state
+        self._recurrence_active = False
+        self.recur_layers: list[int] = []
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -921,6 +934,27 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+    def set_recurrence_active(self, active: bool) -> None:
+        self._recurrence_active = active
+
+    def _get_virtual_layers(self) -> list[int]:
+        """Build virtual layer schedule with depth recurrence.
+        e.g. with num_layers=11 and recur_layers=[4,5]:
+            [0,1,2,3, 4,5, 4,5, 6,7,8,9,10]  -- 13 virtual layers from 11 physical
+        """
+        n = len(self.blocks)
+        if not self._recurrence_active or not self.recur_layers:
+            return list(range(n))
+        virtual = []
+        inserted = False
+        for i in range(n):
+            virtual.append(i)
+            if not inserted and i == self.recur_layers[-1]:
+                for rl in self.recur_layers:
+                    virtual.append(rl)
+                inserted = True
+        return virtual
+
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -941,25 +975,32 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+        virtual = self._get_virtual_layers()
+        # Split virtual layers into encoder and decoder halves
+        v_enc = len(virtual) // 2
+        v_dec = len(virtual) - v_enc
+        for vi in range(v_enc):
+            phys = virtual[vi]
+            ve = self._get_ve(phys, input_ids, ve_cache)
+            x, raw_v = self.blocks[phys](x, x0,
+                self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
+        for i in range(v_dec):
+            vi = v_enc + i
+            phys = virtual[vi]
             if skips:
                 skip = skips.pop()
-                g = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
-                x = torch.lerp(self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip, x, g)
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                skip_idx = min(i, self.num_skip_weights - 1)
+                g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                x = torch.lerp(self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip, x, g)
+            ve = self._get_ve(phys, input_ids, ve_cache)
+            x, _ = self.blocks[phys](x, x0,
+                self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -1001,25 +1042,31 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+        virtual = self._get_virtual_layers()
+        v_enc = len(virtual) // 2
+        v_dec = len(virtual) - v_enc
+        for vi in range(v_enc):
+            phys = virtual[vi]
+            ve = self._get_ve(phys, input_ids, ve_cache)
+            x, raw_v = self.blocks[phys](x, x0,
+                self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
+        for i in range(v_dec):
+            vi = v_enc + i
+            phys = virtual[vi]
             if skips:
                 skip = skips.pop()
-                g = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
-                x = torch.lerp(self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip, x, g)
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                skip_idx = min(i, self.num_skip_weights - 1)
+                g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                x = torch.lerp(self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip, x, g)
+            ve = self._get_ve(phys, input_ids, ve_cache)
+            x, _ = self.blocks[phys](x, x0,
+                self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
+                self.qo_bank[n + phys], self.mlp_up_bank[phys], self.mlp_down_bank[phys],
                 v_embed=ve, v0=v0)
         return self.final_norm(x)
 
@@ -1900,6 +1947,7 @@ def main() -> None:
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
         weight_decay=args.muon_wd,
+        eq_r=args.muon_eq_r,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -2036,6 +2084,12 @@ def main() -> None:
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+        # Depth recurrence activation
+        if args.recur_enabled and step == args.recur_start_step and not base_model._recurrence_active:
+            recur_indices = [int(x) for x in args.recur_layers.split(",") if x.strip()]
+            base_model.recur_layers = recur_indices
+            base_model.set_recurrence_active(True)
+            log0(f"depth_recurrence:activated layers={recur_indices} step={step}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
