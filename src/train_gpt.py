@@ -909,9 +909,26 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
-        # Depth recurrence state
-        self._recurrence_active = False
-        self.recur_layers: list[int] = []
+        # Depth recurrence: build schedule and conditioning parameters
+        recur_layer_str = os.environ.get("RECUR_LAYERS", "4,5")
+        self._recur_layer_set = {int(x) for x in recur_layer_str.split(",") if x.strip()} if recur_layer_str else set()
+        self._recurrence_active = bool(self._recur_layer_set) and bool(int(os.environ.get("RECUR_ENABLED", "1")))
+        self.recur_layers = sorted(self._recur_layer_set)
+        # Build static virtual layer schedule
+        self._flat_schedule = list(range(num_layers))
+        self._recur_schedule = []
+        for i in range(num_layers):
+            self._recur_schedule.append(i)
+            if i in self._recur_layer_set:
+                self._recur_schedule.append(i)
+        # Per-iteration conditioning: iter_embed + iter_gate (PR #1278)
+        num_recur_pos = len(self._recur_schedule) - num_layers
+        if num_recur_pos > 0 and self._recurrence_active:
+            self.iter_embed = nn.Parameter(torch.randn(num_recur_pos, model_dim) * 0.02)
+            self.iter_gate = nn.Parameter(torch.full((num_recur_pos, model_dim), -2.0))
+        else:
+            self.iter_embed = None
+            self.iter_gate = None
         # Parallel residuals: split attn/MLP into lanes from this layer
         parallel_start = int(os.environ.get("PARALLEL_START_LAYER", "7"))
         self.parallel_start_layer = parallel_start
@@ -947,22 +964,10 @@ class GPT(nn.Module):
         self._recurrence_active = active
 
     def _get_virtual_layers(self) -> list[int]:
-        """Build virtual layer schedule with depth recurrence.
-        e.g. with num_layers=11 and recur_layers=[4,5]:
-            [0,1,2,3, 4,5, 4,5, 6,7,8,9,10]  -- 13 virtual layers from 11 physical
-        """
-        n = len(self.blocks)
-        if not self._recurrence_active or not self.recur_layers:
-            return list(range(n))
-        virtual = []
-        inserted = False
-        for i in range(n):
-            virtual.append(i)
-            if not inserted and i == self.recur_layers[-1]:
-                for rl in self.recur_layers:
-                    virtual.append(rl)
-                inserted = True
-        return virtual
+        """Return virtual layer schedule (static for torch.compile fullgraph)."""
+        if self._recurrence_active:
+            return self._recur_schedule
+        return self._flat_schedule
 
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
@@ -988,8 +993,16 @@ class GPT(nn.Module):
         # Split virtual layers into encoder and decoder halves
         v_enc = len(virtual) // 2
         v_dec = len(virtual) - v_enc
+        seen_counts: dict[int, int] = {}
+        recur_idx = 0
         for vi in range(v_enc):
             phys = virtual[vi]
+            seen_counts[phys] = seen_counts.get(phys, 0) + 1
+            # Apply iter_embed conditioning on repeated visits
+            if seen_counts[phys] > 1 and self.iter_embed is not None and recur_idx < self.iter_embed.size(0):
+                gate = torch.sigmoid(self.iter_gate[recur_idx].to(dtype=x.dtype))[None, None, :]
+                x = x + gate * self.iter_embed[recur_idx].to(dtype=x.dtype)[None, None, :]
+                recur_idx += 1
             ve = self._get_ve(phys, input_ids, ve_cache)
             x, raw_v = self.blocks[phys](x, x0,
                 self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
@@ -1004,11 +1017,17 @@ class GPT(nn.Module):
         for i in range(v_dec):
             vi = v_enc + i
             phys = virtual[vi]
+            seen_counts[phys] = seen_counts.get(phys, 0) + 1
             if skips:
                 skip = skips.pop()
                 skip_idx = min(i, self.num_skip_weights - 1)
                 g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                 x = torch.lerp(self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip, x, g)
+            # Apply iter_embed conditioning on repeated visits
+            if seen_counts[phys] > 1 and self.iter_embed is not None and recur_idx < self.iter_embed.size(0):
+                gate = torch.sigmoid(self.iter_gate[recur_idx].to(dtype=x.dtype))[None, None, :]
+                x = x + gate * self.iter_embed[recur_idx].to(dtype=x.dtype)[None, None, :]
+                recur_idx += 1
             # Enter parallel mode when we reach the parallel_start_layer
             if phys >= parallel_phys and not is_parallel:
                 lane0 = x  # attention lane
@@ -1087,8 +1106,15 @@ class GPT(nn.Module):
         virtual = self._get_virtual_layers()
         v_enc = len(virtual) // 2
         v_dec = len(virtual) - v_enc
+        seen_counts: dict[int, int] = {}
+        recur_idx = 0
         for vi in range(v_enc):
             phys = virtual[vi]
+            seen_counts[phys] = seen_counts.get(phys, 0) + 1
+            if seen_counts[phys] > 1 and self.iter_embed is not None and recur_idx < self.iter_embed.size(0):
+                gate = torch.sigmoid(self.iter_gate[recur_idx].to(dtype=x.dtype))[None, None, :]
+                x = x + gate * self.iter_embed[recur_idx].to(dtype=x.dtype)[None, None, :]
+                recur_idx += 1
             ve = self._get_ve(phys, input_ids, ve_cache)
             x, raw_v = self.blocks[phys](x, x0,
                 self.qo_bank[phys], self.kv_bank[phys], self.kv_bank[n + phys],
@@ -1103,11 +1129,16 @@ class GPT(nn.Module):
         for i in range(v_dec):
             vi = v_enc + i
             phys = virtual[vi]
+            seen_counts[phys] = seen_counts.get(phys, 0) + 1
             if skips:
                 skip = skips.pop()
                 skip_idx = min(i, self.num_skip_weights - 1)
                 g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                 x = torch.lerp(self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skip, x, g)
+            if seen_counts[phys] > 1 and self.iter_embed is not None and recur_idx < self.iter_embed.size(0):
+                gate = torch.sigmoid(self.iter_gate[recur_idx].to(dtype=x.dtype))[None, None, :]
+                x = x + gate * self.iter_embed[recur_idx].to(dtype=x.dtype)[None, None, :]
+                recur_idx += 1
             if phys >= parallel_phys and not is_parallel:
                 lane0 = x
                 lane1 = x
@@ -2292,12 +2323,11 @@ def main() -> None:
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
-        # Depth recurrence activation
-        if args.recur_enabled and step == args.recur_start_step and not base_model._recurrence_active:
-            recur_indices = [int(x) for x in args.recur_layers.split(",") if x.strip()]
-            base_model.recur_layers = recur_indices
+        # Depth recurrence: now active from init (static graph for torch.compile)
+        # Delayed activation is kept as fallback if RECUR_START_STEP > 0
+        if args.recur_start_step > 0 and step == args.recur_start_step and not base_model._recurrence_active:
             base_model.set_recurrence_active(True)
-            log0(f"depth_recurrence:activated layers={recur_indices} step={step}")
+            log0(f"depth_recurrence:activated layers={base_model.recur_layers} step={step}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
