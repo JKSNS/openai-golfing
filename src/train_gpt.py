@@ -1045,7 +1045,16 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        focal_gamma = float(os.environ.get("FOCAL_GAMMA", "1.0"))
+        if focal_gamma > 0 and self.training:
+            # Focal loss: downweight easy tokens, focus on hard predictions
+            ce = F.cross_entropy(logits.float(), targets, reduction="none")
+            with torch.no_grad():
+                pt = torch.exp(-ce)
+                focal_weight = (1 - pt).pow(focal_gamma)
+            main_loss = (focal_weight * ce).mean()
+        else:
+            main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
             mtp_loss_sum = x.new_zeros(())
