@@ -14,10 +14,11 @@ Our workspace for the [OpenAI Parameter Golf](https://github.com/openai/paramete
 | Naive Baseline | 1.2244 | 9L 512dim 1024vocab |
 | Merged SOTA | 1.1147 | abaybektursun, Mar 25 — PR #1019 |
 | Best pending (sliding only) | 1.0897 | PR #1296 — SP4096 + Depth Recurrence |
+| **Best pending (SLOT, 3-seed)** | **0.7736** | **PR #1278 — SLOT-32 + depth recurrence** |
 | Best pending (SLOT) | 0.8637 | PR #1313 — SLOT-24 eval-time optimization |
 | Best pending (TTT+SLOT) | 1.0096 | PR #1318 — L-BFGS SLOT + TTT |
 | **Our target (sliding)** | **≤1.08** | **Competitive model quality** |
-| **Our target (L-BFGS SLOT)** | **≤0.76** | **World record attempt** |
+| **Our target (L-BFGS SLOT)** | **≤0.73** | **World record — must beat PR #1278 (0.7736)** |
 
 ## Quick Start
 

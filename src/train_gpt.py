@@ -1147,6 +1147,37 @@ class GPT(nn.Module):
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         return self.compute_logits(self.forward_hidden(input_ids))
 
+# --- N-gram sequence matching (eval-time, complementary to SLOT) ---
+
+class ExactSequenceCache:
+    """Hash-table cache for exact token N-gram matching. Causal: only uses scored tokens."""
+    def __init__(self, min_order: int = 8, max_order: int = 12):
+        self.min_order = min_order
+        self.max_order = max_order
+        self.table: dict[tuple[int, ...], dict[int, int]] = {}
+
+    def update(self, tokens: list[int]) -> None:
+        n = len(tokens)
+        for order in range(self.min_order, self.max_order + 1):
+            for i in range(n - order):
+                key = tuple(tokens[i:i + order])
+                next_tok = tokens[i + order]
+                counts = self.table.setdefault(key, {})
+                counts[next_tok] = counts.get(next_tok, 0) + 1
+
+    def query(self, context: list[int]) -> tuple[int, float] | None:
+        """Try longest order first. Returns (predicted_token, confidence) or None."""
+        for order in range(self.max_order, self.min_order - 1, -1):
+            if len(context) < order:
+                continue
+            key = tuple(context[-order:])
+            if key in self.table:
+                counts = self.table[key]
+                total = sum(counts.values())
+                best_tok = max(counts, key=counts.get)
+                return best_tok, counts[best_tok] / total
+        return None
+
 # --- Sliding window evaluation ---
 
 def eval_val_sliding(
@@ -1190,6 +1221,8 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
+    # N-gram cache (built incrementally from scored tokens)
+    ngram_cache = ExactSequenceCache() if bool(int(os.environ.get("NGRAM_ENABLED", "0"))) else None
     if slot_steps > 0:
         compiled_hidden = torch.compile(base_model.forward_hidden, dynamic=False, fullgraph=True)
         # Pre-detach projection weight to avoid wasted gradient computation
@@ -1316,10 +1349,38 @@ def eval_val_sliding(
                         logits.reshape(-1, logits.size(-1)),
                         targets_flat, reduction="none",
                     ).reshape(bsz, seq_len)
+            # N-gram blending (if enabled) and score accumulation
+            ngram_lambda = float(os.environ.get("NGRAM_LAMBDA", "0.15"))
+            ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "0")))
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll[i, s:wlen].to(torch.float64)
+                if ngram_enabled and ngram_cache is not None and s > 0:
+                    # Blend N-gram predictions with model logits for scored positions
+                    scored_logits = logits[i, s:wlen]  # [scored_len, vocab]
+                    scored_probs = F.softmax(scored_logits.float(), dim=-1)
+                    x_ctx = x_batch[i, :wlen].tolist()
+                    for pos_idx in range(s, wlen):
+                        ctx = x_ctx[:pos_idx + 1]
+                        result = ngram_cache.query(ctx)
+                        if result is not None:
+                            pred_tok, conf = result
+                            blend = min(conf * ngram_lambda, 0.5)
+                            local_pos = pos_idx - s
+                            one_hot = torch.zeros_like(scored_probs[local_pos])
+                            one_hot[pred_tok] = 1.0
+                            scored_probs[local_pos] = (1 - blend) * scored_probs[local_pos] + blend * one_hot
+                    # Recompute NLL from blended probs
+                    tgt_scored = y_batch[i, s:wlen]
+                    scored_nll = -torch.log(scored_probs.gather(1, tgt_scored.unsqueeze(1)).squeeze(1).clamp_min(1e-10)).to(torch.float64)
+                    # Update cache with newly scored tokens
+                    scored_tokens = val_tokens[ws:ws + wlen].tolist()
+                    ngram_cache.update(scored_tokens)
+                else:
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    if ngram_enabled and ngram_cache is not None:
+                        scored_tokens = val_tokens[ws:ws + wlen].tolist()
+                        ngram_cache.update(scored_tokens)
                 loss_sum += scored_nll.sum()
                 token_count += float(wlen - s)
                 tgt = y_batch[i, s:wlen]

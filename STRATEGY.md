@@ -9,17 +9,20 @@ The merged SOTA on the README is 1.1147 BPB, but **12+ pending PRs beat it**. Th
 
 | Tier | BPB | PR | Method |
 |------|-----|-----|--------|
-| SLOT aggressive | 0.6951 | #1319 | SLOT-64 (EXCEEDS eval time limit) |
-| SLOT moderate | 0.8637 | #1313 | SLOT-24 AdamW, 3-seed validated |
+| SLOT aggressive (invalid) | 0.6951 | #1319 | SLOT-64 (EXCEEDS eval time limit) |
+| **SLOT-32 (REAL TARGET)** | **0.7736** | **#1278** | **SLOT-32 + depth recurrence w/ iter_embed, 3-seed** |
+| SLOT-24 | 0.8637 | #1313 | SLOT-24 AdamW, 3-seed validated |
 | TTT + L-BFGS SLOT | 1.0096 | #1318 | L-BFGS logit-space SLOT, 3-seed |
 | Causal SLOT + Pre-quant TTT | 1.0846 | #1306 | -0.051 nats vs merged SOTA |
 | **Sliding only (no SLOT/TTT)** | **1.0897** | **#1296** | **SP4096 + Depth Recurrence + MuonEq-R** |
 | N-gram matching | 1.1143 | #1309 | Exact n-gram on SOTA base |
 | Merged SOTA | 1.1147 | #1019 | AR Self-Gen GPTQ + XSA-all |
 
-**Key insight:** SLOT is the new meta. Even a mediocre model (sliding BPB ~1.12) drops to 0.86 with aggressive SLOT. But the best pure-model entry (no SLOT/TTT) is **1.0897** using SP4096 + depth recurrence.
+**SLOT scaling law:** SLOT-8→~1.10, SLOT-16→~0.93, SLOT-24→~0.86, SLOT-32→~0.77
 
-**Our target must be calibrated to this reality:**
+**CAUTION:** PRs #1272 and #1240 argue standard SLOT violates causal dependence — the delta is optimized on future tokens then applied to all positions. If SLOT is ruled illegal, scores revert to ~1.08-1.10.
+
+**Our target:**
 - To get on the leaderboard with sliding-only: need ~1.08 BPB
 - To get on with SLOT: need ~0.85 BPB (easier with SLOT but more controversial)
 - Safest strategy: strong model (~1.09) + SLOT (~0.85–0.95)
