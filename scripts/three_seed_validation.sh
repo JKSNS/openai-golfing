@@ -23,9 +23,19 @@ for SEED in 1337 42 314; do
     DATA_PATH=./upstream/data/datasets/fineweb10B_sp1024/ \
     TOKENIZER_PATH=./upstream/data/tokenizers/fineweb_1024_bpe.model \
     VOCAB_SIZE=1024 \
-    SLOT_STEPS=16 \
-    SLOT_LR=0.008 \
-    SLOT_LR_MIN=0.0008 \
+    SLOT_STEPS=24 \
+    SLOT_LR=0.012 \
+    SLOT_LR_MIN=0.001 \
+    SLOT_WARMSTART_ALPHA=0.85 \
+    TTT_ENABLED=1 \
+    TTT_EPOCHS=6 \
+    TTT_FREEZE_BLOCKS=2 \
+    RECUR_ENABLED=1 \
+    RECUR_LAYERS=4,5 \
+    RECUR_START_STEP=3000 \
+    MUON_EQ_R=1 \
+    MUON_WD=0.09 \
+    QK_GAIN_INIT=5.0 \
     torchrun --standalone --nproc_per_node=8 src/train_gpt.py 2>&1 | tee "experiments/validation_seed${SEED}_$(date +%Y%m%d_%H%M%S).log"
 
     echo ""
