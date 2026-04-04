@@ -115,6 +115,12 @@ class Hyperparameters:
  ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
  ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
  ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+ # NOVEL: SLOT-aware meta-training (train model to be SLOT-friendly)
+ meta_slot_enabled = bool(int(os.environ.get("META_SLOT", "1")))
+ meta_slot_every = int(os.environ.get("META_SLOT_EVERY", 4))  # every N steps, do meta-SLOT instead of normal training
+ meta_slot_inner_steps = int(os.environ.get("META_SLOT_INNER_STEPS", 2))  # inner loop SLOT optimization steps
+ meta_slot_inner_lr = float(os.environ.get("META_SLOT_INNER_LR", 0.01))  # inner loop delta learning rate
+ meta_slot_start_step = int(os.environ.get("META_SLOT_START", 500))  # don't meta-train too early
  recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
  a, b, c = (3.4445, -4.7750, 2.0315)
@@ -1058,6 +1064,43 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
   else:
    out[name] = (q.float() * float(s.item())).to(orig_dtype)
  return out
+def meta_slot_loss(base_model, x, y, inner_steps=2, inner_lr=0.01):
+ """NOVEL: Compute loss through SLOT-adapted hidden states (FOMAML-style).
+ Instead of loss = model(x, y), we:
+ 1. Get hidden states h = model.forward_hidden(x)
+ 2. Optimize delta for inner_steps to minimize CE(project(h+delta), y)
+ 3. Return the loss WITH the adapted delta — gradients flow back to model
+ This trains the model to produce SLOT-friendly hidden states.
+ """
+ # Forward pass to get hidden states (keep in graph for outer gradients)
+ h = base_model.forward_hidden(x)  # [bsz, seq, dim]
+ # Detach for inner loop (FOMAML: no second-order gradients)
+ h_detached = h.detach().requires_grad_(False)
+ # Get projection weights
+ if base_model.tie_embeddings:
+  proj_w = base_model.tok_emb.weight.detach()
+ else:
+  proj_w = base_model.lm_head.weight.detach()
+ softcap = base_model.logit_softcap
+ targets = y.reshape(-1)
+ # Inner loop: optimize delta on detached hidden states
+ delta = torch.zeros(1, 1, h.size(-1), device=h.device, dtype=torch.float32, requires_grad=True)
+ for _ in range(inner_steps):
+  h_adapted = h_detached.float() + delta
+  logits_proj = F.linear(h_adapted, proj_w.float())
+  logits = softcap * torch.tanh(logits_proj / softcap)
+  inner_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets, reduction="mean")
+  grad = torch.autograd.grad(inner_loss, delta)[0]
+  delta = (delta - inner_lr * grad).detach().requires_grad_(True)
+ # Outer loss: apply optimized delta to ORIGINAL (in-graph) hidden states
+ h_final = h + delta.detach().to(h.dtype)  # delta is detached, h carries gradients
+ if base_model.tie_embeddings:
+  logits_proj = F.linear(h_final.reshape(-1, h_final.size(-1)), base_model.tok_emb.weight)
+ else:
+  logits_proj = base_model.lm_head(h_final.reshape(-1, h_final.size(-1)))
+ logits = softcap * torch.tanh(logits_proj / softcap)
+ return F.cross_entropy(logits.float(), targets, reduction="mean")
+
 def ttt_adapt_adamw(args, base_model, device, val_tokens, rank=0, world_size=1, log0=print):
  """Pre-quant TTT: fine-tune on val data BEFORE quantization (PR #1006/1306).
  Post-quant TTT fails on GPTQ stacks. Pre-quant works: adapted weights quantize better."""
@@ -1387,12 +1430,19 @@ def main() -> None:
    log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
   zero_grad_all()
   train_loss = torch.zeros((), device=device)
+  # NOVEL: Periodically use meta-SLOT loss instead of normal loss
+  use_meta_slot = (args.meta_slot_enabled and step >= args.meta_slot_start_step
+                   and step % args.meta_slot_every == 0)
   for micro_step in range(grad_accum_steps):
    if distributed:
     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
    x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-    loss = model(x, y)
+    if use_meta_slot:
+     loss = meta_slot_loss(base_model, x, y,
+      inner_steps=args.meta_slot_inner_steps, inner_lr=args.meta_slot_inner_lr)
+    else:
+     loss = model(x, y)
    train_loss += loss.detach()
    (loss * grad_scale).backward()
   train_loss /= grad_accum_steps

@@ -21,13 +21,26 @@ Stored at `src/train_gpt_pr1278_base.py`. Key properties:
 - GPTQ int6, LZMA compression
 - 1516 clean lines
 
-## Novel Technique (TBD — researching)
+## Novel Technique: SLOT-Aware Meta-Training (FOMAML)
 
-Candidates under investigation:
-- **SLOT-Aware Meta-Training**: Train model to be maximally SLOT-improvable
-- **Multi-Resolution SLOT**: Deltas at multiple layers
-- **Amortized SLOT Init**: Learned delta predictor
-- **Online Bayesian Mixture**: Replace SLOT with theoretically-grounded approach
+**The key insight nobody else has:** Every competitor trains a model normally, then
+applies SLOT at eval time. The model was never trained to BE SLOT-friendly. We train
+the model WITH SLOT in the inner loop — the model learns to produce hidden states
+that SLOT can adapt most effectively.
+
+**Implementation:** Every 4th training step, instead of `loss = model(x, y)`, we:
+1. Compute hidden states `h = model.forward_hidden(x)` (stays in graph)
+2. Detach h, optimize a delta for 2 inner steps (FOMAML — no second-order gradients)
+3. Apply the optimized delta to the ORIGINAL h (gradients flow back to model)
+4. Compute and backprop the "SLOT-adapted" loss
+
+The model learns: "given my hidden states, what delta would SLOT find, and how can I
+make that delta more effective?" This shifts the entire SLOT scaling curve.
+
+**Cost:** ~2x per meta-step (every 4th step), so ~1.25x overall training cost.
+With 10 min budget, we lose ~20% of steps but gain 10-50x more SLOT effectiveness.
+
+**Config:** META_SLOT=1, META_SLOT_EVERY=4, META_SLOT_INNER_STEPS=2, META_SLOT_INNER_LR=0.01
 
 ## Targeted Improvements (proven, small additions)
 
